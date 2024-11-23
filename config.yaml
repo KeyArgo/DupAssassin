@@ -1,0 +1,6 @@
+api:
+  openlibrary:
+    base_url: https://openlibrary.org
+    timeout: 30
+    retry_attempts: 3
+    rate_limit: 1
