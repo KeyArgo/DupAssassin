@@ -13,6 +13,11 @@ A Python tool for finding and managing duplicate media files, with specialized h
   - Ebooks
 - Interactive or report-only modes
 - Synology NAS compatibility (@eaDir handling)
+- Enhanced reporting capabilities:
+  - HTML reports with visual formatting
+  - JSON export of potential duplicates
+  - Directory-based statistics
+  - Space savings calculations
 
 ## Installation
 
@@ -34,18 +39,33 @@ Run `python DupAssassin.py` and follow the interactive prompts.
 - OpenLibrary integration
 - Intelligent duplicate detection
 - Format: .mp3, .m4b, .aac
+- Advanced pattern matching for:
+  - Series detection
+  - Chapter identification
+  - Book numbering
+  - Multiple formats
 
 ### Other Media
 - Movies: .mp4, .mkv, .avi, .mov
 - TV Shows: .mp4, .mkv, .avi, .mov
 - Ebooks: .epub, .mobi, .pdf, .azw, .azw3, .djvu
 
+## Reports
+- HTML reports with CSS styling
+- JSON export for data persistence
+- Directory-based statistics
+- Space savings calculations
+- Processing statistics:
+  - File processing rates
+  - API success rates
+  - Error tracking
+  - Memory usage
+
 ## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details
 
 ## Requirements
-
-- tqdm
-- requests
-- python-dateutil
+- Python 3.8+
+- OpenLibrary API access
+- Required Python packages in requirements.txt
