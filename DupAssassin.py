@@ -24,7 +24,11 @@ def main_menu():
         elif choice == "2":
             shows.process_shows()
         elif choice == "3":
-            process_audiobooks()
+            directories = get_directories()
+            if directories:
+                process_audiobooks(directories)
+            else:
+                print("No valid directories provided. Please try again.")
         elif choice == "4":
             ebooks.process_ebooks()
         elif choice == "5":
@@ -58,19 +62,42 @@ if __name__ == "__main__":
     # Create banner
     print("""
 ╔═══════════════════════════════════════════╗
-║           DupAssassin v1.0.1-α            ║
+║           DupAssassin v1.0.2-α            ║
 ║      Your Duplicate File Eliminator       ║
 ╚═══════════════════════════════════════════╝
     """)
     
-    # Ensure the Duplicates directory exists
-    os.makedirs("Duplicates", exist_ok=True)
-    
-    try:
-        main_menu()
-    except KeyboardInterrupt:
-        print("\nProgram interrupted by user. Exiting...")
-        sys.exit(0)
-    except Exception as e:
-        print(f"\nAn error occurred: {e}")
-        sys.exit(1)
+    print("\n=== DupAssassin: Media Duplicate Finder ===")
+    print("A tool to find and eliminate duplicate media files\n")
+
+    while True:
+        print("Select media type to scan:")
+        print("1. Movies")
+        print("2. TV Shows")
+        print("3. Audiobooks")
+        print("4. Ebooks")
+        print("5. Exit")
+
+        choice = input("\nEnter your choice (1-5): ")
+
+        if choice == "3":  # Audiobooks
+            print("\nEnter directories to scan (one per line, empty line to finish):")
+            directories = []
+            while True:
+                directory = input("> ").strip()
+                if not directory:
+                    break
+                if os.path.isdir(directory):
+                    directories.append(directory)
+                else:
+                    print(f"Warning: '{directory}' is not a valid directory")
+            
+            if directories:
+                process_audiobooks(directories)
+            else:
+                print("No valid directories provided. Please try again.")
+                
+        elif choice == "5":
+            sys.exit(0)
+        else:
+            print("Feature not implemented yet.")

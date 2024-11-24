@@ -23,6 +23,130 @@ from concurrent.futures import wait
 from library_metadata import LibraryMetadataProcessor, BookMetadata
 import json
 
+# Rate limiter for OpenLibrary API
+class OpenLibraryRateLimiter:
+    def __init__(self):
+        self.requests_per_window = 100
+        self.window_seconds = 300  # 5 minutes
+        self.request_timestamps = []
+        self.lock = threading.Lock()
+        
+    def wait(self):
+        with self.lock:
+            now = time.time()
+            self.request_timestamps = [ts for ts in self.request_timestamps 
+                                    if now - ts < self.window_seconds]
+            
+            if len(self.request_timestamps) >= self.requests_per_window:
+                sleep_time = self.window_seconds - (now - self.request_timestamps[0])
+                if sleep_time > 0:
+                    logger.info(f"Rate limit reached. Waiting {sleep_time:.1f} seconds...")
+                    time.sleep(sleep_time)
+            
+            # Always wait at least 3 seconds between requests
+            if self.request_timestamps:
+                time_since_last = now - self.request_timestamps[-1]
+                if time_since_last < 3:
+                    time.sleep(3 - time_since_last)
+            
+            self.request_timestamps.append(time.time())
+
+# Initialize rate limiter
+rate_limiter = OpenLibraryRateLimiter()
+
+def search_openlibrary(book_info: Dict[str, str]) -> Optional[Dict]:
+    """Search OpenLibrary with improved query parameters"""
+    base_url = "https://openlibrary.org/search.json"
+    
+    # Wait for rate limit
+    rate_limiter.wait()
+    
+    # Clean and build query
+    title = clean_search_term(book_info.get('title', ''))
+    author = book_info.get('author', '')
+    
+    # Build query parameters
+    params = {
+        'fields': 'key,title,author_name,first_publish_year,edition_count,cover_i,editions,isbn,language',
+        'limit': 5  # Get top 5 matches for better selection
+    }
+    
+    if title and author:
+        params['q'] = f'title:"{title}" AND author:"{author}"'
+    elif title:
+        params['q'] = f'title:"{title}"'
+    else:
+        logger.debug("Insufficient search terms")
+        return None
+    
+    try:
+        response = requests.get(base_url, params=params, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        
+        if not data or not data.get('docs'):
+            logger.debug(f"No matches found for query: {params['q']}")
+            return None
+            
+        # Score matches to find best one
+        best_match = None
+        best_score = 0
+        
+        for doc in data['docs']:
+            if not doc:  # Skip empty documents
+                continue
+                
+            score = _score_match(doc, book_info)
+            if score > best_score:
+                best_score = score
+                best_match = doc
+        
+        if best_match and best_score >= 0.5:  # Check best_match is not None
+            logger.debug(f"Found match: {best_match.get('title')} (score: {best_score:.2f})")
+            return best_match
+        else:
+            logger.debug(f"No confident matches (best score: {best_score:.2f})")
+            return None
+            
+    except Exception as e:
+        logger.error(f"OpenLibrary API error: {e}")
+        return None
+
+def _score_match(doc: Dict[str, Any], book_info: Dict[str, str]) -> float:
+    """Score how well a document matches the book info"""
+    score = 0.0
+    
+    # Title similarity (0-0.5 points)
+    if doc.get('title') and book_info.get('title'):
+        title_similarity = _string_similarity(
+            doc['title'].lower(),
+            book_info['title'].lower()
+        )
+        score += title_similarity * 0.5
+    
+    # Author match (0-0.3 points)
+    if doc.get('author_name') and book_info.get('author'):
+        author_similarity = max(
+            _string_similarity(author.lower(), book_info['author'].lower())
+            for author in doc['author_name']
+        )
+        score += author_similarity * 0.3
+    
+    # Bonus points (0-0.2 points)
+    if doc.get('isbn'):  # Has ISBN
+        score += 0.1
+    if doc.get('language', [''])[0] == 'eng':  # English version available
+        score += 0.05
+    if doc.get('cover_i'):  # Has cover image
+        score += 0.05
+    
+    return score
+
+def _string_similarity(s1: str, s2: str) -> float:
+    """Calculate string similarity using Levenshtein distance"""
+    from difflib import SequenceMatcher
+    return SequenceMatcher(None, s1, s2).ratio()
+    
 SUPPORTED_EXTENSIONS = ['.mp3', '.m4b', '.aac']
 
 # Compile patterns once at module level
@@ -107,14 +231,47 @@ class FileInfo(TypedDict):
 
 class DuplicateGroup(TypedDict):
     files: List[FileInfo]
-    metadata: BookMetadata
-    suggested_name: str
-    openlibrary_url: Optional[str]
+    metadata: Optional[BookMetadata]
+    suggested_name: Optional[str]
+    ol_url: Optional[str]
 
 # Type definitions
 GroupType = Union[List[FileInfo], DuplicateGroup]
-InitialGroupType = Dict[str, List[Dict[str, Any]]]  # Fixed: Added missing closing bracket
+InitialGroupType = Dict[str, List[Dict[str, Any]]]
 
+def generate_openlibrary_report(results: Dict[str, DuplicateGroup], output_dir: str = "reports") -> str:
+    """Generate a detailed report of OpenLibrary matches"""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    os.makedirs(output_dir, exist_ok=True)
+    report_path = os.path.join(output_dir, f"openlibrary_matches_{timestamp}.txt")
+    
+    matched_groups = {
+        group_name: data 
+        for group_name, data in results.items() 
+        if data.get('ol_url')
+    }
+    
+    with open(report_path, 'w', encoding='utf-8') as f:
+        f.write("=== OpenLibrary Matches Report ===\n")
+        f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"Total matches found: {len(matched_groups)}\n\n")
+        
+        for group_name, data in matched_groups.items():
+            f.write(f"\nGroup: {group_name}\n")
+            f.write(f"OpenLibrary URL: {data['ol_url']}\n")
+            if data.get('metadata'):
+                meta = data['metadata']
+                f.write("Metadata:\n")
+                f.write(f"  Title: {getattr(meta, 'title', 'N/A')}\n")
+                f.write(f"  Author: {getattr(meta, 'author', 'N/A')}\n")
+                f.write(f"  ISBN: {getattr(meta, 'isbn', 'N/A')}\n")
+            f.write("Files:\n")
+            for file_info in data['files']:
+                f.write(f"  - {file_info['path']}\n")
+            f.write("-" * 80 + "\n")
+    
+    return report_path
+    
 # The @lru_cache decorator is valid Python syntax - ignore the type checker error
 @lru_cache(maxsize=1000)
 def get_normalized_path(filepath: str) -> Tuple[str, str, str]:
@@ -440,18 +597,34 @@ def search_ol_api(query: Dict[str, str]) -> Optional[Dict[str, Any]]:
         logger.error(f"Error in OpenLibrary API search: {e}")
         return None
 
-def clean_search_term(term: str) -> str:
-    """Clean up search terms for better matching"""
-    # Remove common audiobook indicators
-    term = re.sub(r'\b(mp3|m4b|audiobook|unabridged|chapterized)\b', '', term, flags=re.IGNORECASE)
-    # Remove parenthetical info like (Book 1) or (Series Name #1)
-    term = re.sub(r'\([^)]*\)', '', term)
-    # Remove file info like 32k, 128k, etc.
-    term = re.sub(r'\b\d+k\b', '', term)
-    # Remove timestamps and common separators
-    term = re.sub(r'\d{2}\.\d{2}\.\d{2}', '', term)
-    term = re.sub(r'[-_]', ' ', term)
-    return term.strip()
+def clean_search_term(title: str) -> str:
+    """Clean up audiobook filenames for better searching"""
+    # Remove common audiobook patterns
+    patterns = [
+        r'(?i)part\s*\d+',           # Remove "part X"
+        r'(?i)cd\s*\d+',             # Remove "CD X"
+        r'(?i)disk\s*\d+',           # Remove "disk X"
+        r'(?i)track\s*\d+',          # Remove "track X"
+        r'\d{2}\.\d{2}\.\d{2}',      # Remove timestamps
+        r'\b\d+k\b',                 # Remove bitrates
+        r'\d{2,4}',                  # Remove standalone numbers
+        r'(?i)chapter\s*\d+',        # Remove chapter numbers
+        r'(?i)(mp3|m4b|audiobook)',  # Remove format indicators
+        r'\[.*?\]',                  # Remove bracketed text
+        r'\(.*?\)',                  # Remove parenthetical text
+        r'[-_\.]+'                   # Replace separators with space
+    ]
+    
+    # Apply all cleaning patterns
+    cleaned = title
+    for pattern in patterns:
+        cleaned = re.sub(pattern, ' ', cleaned)
+    
+    # Clean up extra whitespace and punctuation
+    cleaned = re.sub(r'\s+', ' ', cleaned)
+    cleaned = cleaned.strip(' .-_')
+    
+    return cleaned
 
 class OpenLibraryClient:
     def __init__(self):
@@ -521,35 +694,8 @@ class OpenLibraryClient:
             logger.error(f"Request failed: {e}")
             return None
 
-# Initialize the global client
+# Add near the top of the file with other initializations
 ol_client = OpenLibraryClient()
-
-def search_openlibrary(book_info: BookInfo) -> Optional[Dict[str, Any]]:
-    """Search OpenLibrary using the global client"""
-    if not book_info:
-        return None
-        
-    # Clean and prepare search terms
-    title = clean_search_term(book_info.get('title', ''))
-    author = clean_search_term(book_info.get('author', ''))
-    
-    # Try different search strategies
-    queries = [
-        {'title': title, 'author': author} if title and author else None,
-        {'q': f"{author} {title}"} if author and title else None,
-        {'title': title} if title else None,
-        {'author': author} if author else None
-    ]
-    
-    for query in queries:
-        if not query:
-            continue
-            
-        result = ol_client.search(query)
-        if result and result.get('docs'):
-            return result
-            
-    return None
 
 def group_by_directory(files):
     """Group files by their parent directory"""
@@ -559,60 +705,35 @@ def group_by_directory(files):
         groups[parent].append(f)
     return groups
 
-def print_duplicates(duplicates, include_ol_info=False, output_file=None) -> str:
-    """Generate duplicate files report in a readable format and return as string"""
+def print_duplicates(groups: Mapping[str, GroupType], include_ol_info: bool = False, output_file: Optional[str] = None) -> str:
+    """Print duplicate groups and optionally save to file"""
     output = []
-    if not duplicates:
-        output.append("\nNo duplicates found.")
-    else:
-        output.append("\nDuplicate Groups Found:")
-        output.append("=" * 80)
-        total_wasted_space = 0
+    
+    for name, group_data in groups.items():
+        output.append(f"\nGroup: {name}")
+        output.append("-" * 80)
         
-        for name, group in sorted(duplicates.items()):
-            files = group.get('files', group) if include_ol_info else group
-            
-            if include_ol_info and isinstance(group, dict) and 'metadata' in group:
-                ol_info = group['metadata']
-                output.append(f"\nBook: {name}")
-                output.append("-" * 80)
-                output.append(f"Title: {ol_info.get('title', 'Unknown')}")
-                output.append(f"Author: {ol_info.get('author_name', ['Unknown'])[0]}")
-                if ol_info.get('year'):
-                    output.append(f"First Published: {ol_info['year']}")
-                output.append(f"Known Editions: {ol_info.get('editions', 0)}")
-                output.append("")
-            
-            total_size = sum(get_directory_size(Path(f['path']).parent) for f in files)
-            wasted_space = total_size - min(get_directory_size(Path(f['path']).parent) for f in files)
-            total_wasted_space += wasted_space
-            
-            output.append(f"Total Size: {total_size / (1024**3):.2f} GB")
-            output.append(f"Potential Space Savings: {wasted_space / (1024**3):.2f} GB\n")
-            
-            for dir_path, dir_files in group_by_directory(files).items():
-                output.append(f"  Directory: {dir_path}")
-                dir_size = get_directory_size(dir_path)
-                output.append(f"  Size: {dir_size / (1024**2):.2f} MB")
-                for f in dir_files:
-                    if 'name' not in f:
-                        logger.warning("Missing 'name' key in:", f)
-                        continue
-                    output.append(f"    - {f['name']}")
-            output.append("\n" + "=" * 80)
-            
-        output.append("\n" + "=" * 80)
-        output.append(f"Total Potential Space Savings: {total_wasted_space / (1024**3):.2f} GB")
-
-    # Convert output list to string
-    report_text = '\n'.join(output)
+        if isinstance(group_data, dict) and include_ol_info:
+            if metadata := group_data.get('metadata'):
+                output.append("\nOpenLibrary Information:")
+                output.append(f"Title: {getattr(metadata, 'title', 'Unknown')}")
+                output.append(f"Author: {getattr(metadata, 'author', 'Unknown')}")
+                output.append(f"ISBN: {getattr(metadata, 'isbn', 'N/A')}")
+                output.append(f"URL: {group_data.get('ol_url', 'N/A')}")
+                output.append(f"Suggested filename: {group_data.get('suggested_name', 'N/A')}")
+        
+        files = group_data['files'] if isinstance(group_data, dict) else group_data
+        for file in files:
+            output.append(f"  {file['path']} ({file['size'] / 1024 / 1024:.2f} MB)")
     
-    # Write to file if specified
+    report = "\n".join(output)
+    
     if output_file:
+        os.makedirs(os.path.dirname(output_file), exist_ok=True)
         with open(output_file, 'w', encoding='utf-8') as f:
-            f.write(report_text)
+            f.write(report)
     
-    return report_text
+    return output_file if output_file else report
 
 def process_file(file_tuple, extensions):
     """Simplified file processing focusing only on path and name"""
@@ -737,13 +858,22 @@ class DuplicateFinder:
             if not preview_duplicates(typed_groups, self):
                 logger.info("User cancelled operation after preview")
                 return {}
+                
+            gc.collect()
             
             # Process with OpenLibrary
             logger.info("Starting OpenLibrary API processing...")
             enriched_groups = process_with_openlibrary(initial_groups)
             
-            # Generate final report
-            self.generate_report(enriched_groups, timestamp)
+            # Generate final report with error handling
+            try:
+                logger.info("Generating final reports...")
+                text_report, html_report = self.generate_report(enriched_groups, timestamp)
+                logger.info(f"Reports generated successfully:")
+                logger.info(f"Text report: {text_report}")
+                logger.info(f"HTML report: {html_report}")
+            except Exception as e:
+                logger.error(f"Error generating reports: {e}", exc_info=True)
             
             return enriched_groups
             
@@ -942,100 +1072,44 @@ def extract_pattern(name: str) -> str:
     pattern = re.sub(r'[a-zA-Z]+', 'W', pattern)
     return pattern
 
-def scan_directories(directories: List[str], extensions: List[str] = SUPPORTED_EXTENSIONS) -> Tuple[List[FileInfo], int]:
-    all_files: List[FileInfo] = []
-    total_files = 0
-    
-    for directory in directories:
-        for root, _, files in os.walk(directory):
-            matching_files = [
-                FileInfo(
-                    name=f,
-                    path=os.path.join(root, f),
-                    size=os.path.getsize(os.path.join(root, f)),
-                    original_name=None,
-                    book_info=None
-                )
-                for f in files if f.endswith(tuple(extensions))
-            ]
-            all_files.extend(matching_files)
-            total_files += len(matching_files)
-    
-    return all_files, total_files
-
 # Initialize the processor
 metadata_processor = LibraryMetadataProcessor()
 
 def process_with_openlibrary(duplicates: InitialGroupType) -> Dict[str, DuplicateGroup]:
     results: Dict[str, DuplicateGroup] = {}
     total_groups = len(duplicates)
-    successful_matches = 0
-    attempted_matches = 0
     
-    with tqdm(total=total_groups, desc="Processing with OpenLibrary API", unit="groups") as pbar:
+    with tqdm(total=total_groups, desc="Processing with OpenLibrary API") as pbar:
         for group_name, files in duplicates.items():
-            if not files:
-                pbar.update(1)
-                continue
-                
             try:
-                attempted_matches += 1
-                file_info = ensure_fileinfo(files[0])
-                filename = file_info['name']
-                filepath = file_info['path']
+                file_info = convert_to_fileinfo(files[0])
+                book_info = extract_book_info(file_info['name'], file_info['path'])
                 
-                book_info = extract_book_info(filename, filepath)
-                if not book_info:
-                    logger.warning(f"Could not extract book info for {filepath}")
-                    pbar.update(1)
-                    continue
-                    
-                ol_data = search_openlibrary(book_info)
-                if not ol_data:
-                    logger.debug(f"No OpenLibrary match found for: {group_name}")
-                    pbar.update(1)
-                    continue
+                # Build search query
+                query = {'title': clean_search_term(book_info['title'])}
+                if book_info['author']:
+                    query['author'] = book_info['author']
                 
-                # Get OpenLibrary URL
-                ol_url = f"https://openlibrary.org{ol_data.get('key', '')}" if ol_data.get('key') else None
-                if ol_url:
-                    logger.info(f"Found OpenLibrary match for {group_name}: {ol_url}")
-                else:
-                    logger.debug(f"Found OpenLibrary data but no URL for: {group_name}")
-                    
-                metadata = metadata_processor.normalize_book_data(ol_data, filepath=filepath)
-                if not metadata:
-                    logger.warning(f"Could not normalize metadata for {filepath}")
-                    pbar.update(1)
-                    continue
-                    
-                suggested_name = metadata_processor.generate_filename(metadata)
-                if not suggested_name:
-                    logger.warning(f"Could not generate filename for {filepath}")
-                    pbar.update(1)
-                    continue
-                    
-                # Only count as success if we got all the way through
-                successful_matches += 1
-                results[group_name] = DuplicateGroup(
-                    files=[ensure_fileinfo(f) for f in files],
-                    metadata=metadata,
-                    suggested_name=suggested_name,
-                    openlibrary_url=ol_url  # Add URL to the group data
-                )
+                # Use rate limiter
+                rate_limiter.wait()
                 
+                logger.debug(f"Searching OpenLibrary with query: {query}")
+                ol_data = ol_client.search(query)
+                
+                if ol_data and ol_data.get('docs'):
+                    metadata = metadata_processor.normalize_book_data(ol_data['docs'][0])
+                    if metadata:
+                        results[group_name] = {
+                            'files': [cast(FileInfo, f) for f in files],
+                            'metadata': metadata,
+                            'suggested_name': metadata_processor.generate_filename(metadata),
+                            'ol_url': f"https://openlibrary.org{ol_data['docs'][0].get('key', '')}"
+                        }
             except Exception as e:
                 logger.error(f"Error processing group {group_name}: {e}")
-                
+                continue
             finally:
                 pbar.update(1)
-    
-    # Calculate and log success rate
-    success_rate = (successful_matches / attempted_matches * 100) if attempted_matches > 0 else 0
-    logger.info(f"OpenLibrary matching complete:")
-    logger.info(f"  Total groups attempted: {attempted_matches}")
-    logger.info(f"  Successful matches: {successful_matches}")
-    logger.info(f"  Success rate: {success_rate:.1f}%")
     
     return results
 
@@ -1063,11 +1137,10 @@ def preview_duplicates(duplicates: Mapping[str, GroupType], finder: DuplicateFin
         elif choice == '4':
             return True
         elif choice == '5':
-            sys.exit(0)  # Exit immediately without further prompts
+            sys.exit(0)
         elif choice == '6':
             print("\nProcessing Status:")
             print(f"Files processed: {finder.stats['files_processed']}")
-            print(f"Processing rate: {finder.stats['files_processed'] / (time.time() - finder.stats['start_time']):.1f} files/sec")
             print(f"Time since last progress: {time.time() - finder.stats['last_progress_time']:.1f} seconds")
         else:
             print("Invalid choice. Please try again.")
@@ -1086,22 +1159,15 @@ def preview_initial_scan(finder: DuplicateFinder, groups: Mapping[str, GroupType
         choice = input("\nEnter choice (1-4): ")
         
         if choice == '1':
-            for name, group in groups.items():
-                print(f"\nGroup: {name}")
-                files = group['files'] if isinstance(group, dict) else group
-                for file in files:
-                    print(f"  {file['path']}")
+            _show_duplicate_groups(groups)
         elif choice == '2':
-            total_size = sum(
-                sum(f['size'] for f in (group['files'] if isinstance(group, dict) else group))
-                for group in groups.values()
-            )
-            print(f"\nTotal groups: {len(groups)}")
-            print(f"Total size: {format_size(total_size)}")
+            _show_directory_stats(groups)
         elif choice == '3':
             return True
         elif choice == '4':
-            return False
+            sys.exit(0)
+        else:
+            print("Invalid choice. Please try again.")
 
 def _show_directory_stats(groups: Mapping[str, GroupType]) -> None:
     dir_stats: Dict[str, Dict[str, Union[int, float]]] = defaultdict(lambda: {'files': 0, 'size': 0})
@@ -1180,260 +1246,127 @@ def signal_handler(signum, frame):
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
-def main() -> None:
-    # Create DuplicateFinder instance
-    finder = DuplicateFinder()
-    
-    # Get directories to scan
-    directories = get_directories()
-    if not directories:
-        logger.error("No directories provided. Exiting.")
-        return
-        
-    try:
-        # Process directories with default extensions
-        finder.process_directories(directories, SUPPORTED_EXTENSIONS)
-    except KeyboardInterrupt:
-        logger.info("Process interrupted by user")
-    except Exception as e:
-        logger.error(f"Error processing directories: {e}")
 
-if __name__ == "__main__":
-    main()
+def convert_groups(initial_groups: InitialGroupType) -> Dict[str, GroupType]:
+    """Convert initial groups to properly typed groups"""
+    converted: Dict[str, GroupType] = {}
+    for name, files in initial_groups.items():
+        converted[name] = [cast(FileInfo, f) for f in files]
+    return converted
+
+def save_potential_duplicates(groups: Dict[str, GroupType], timestamp: str) -> None:
+    """Save potential duplicates before OpenLibrary processing"""
+    save_dir = "potential_duplicates"
+    os.makedirs(save_dir, exist_ok=True)
+    
+    save_path = os.path.join(save_dir, f"potential_duplicates_{timestamp}.json")
+    
+    # Convert to serializable format
+    serializable_groups = {}
+    for name, group in groups.items():
+        if isinstance(group, list):
+            serializable_groups[name] = [dict(f) for f in group]
+        else:
+            serializable_groups[name] = {
+                'files': [dict(f) for f in group['files']],
+                'metadata': group.get('metadata').__dict__ if group.get('metadata') else None,
+                'suggested_name': group.get('suggested_name'),
+                'ol_url': group.get('ol_url')
+            }
+    
+    with open(save_path, 'w', encoding='utf-8') as f:
+        json.dump(serializable_groups, f, indent=2, ensure_ascii=False)
 
 def generate_html_report(groups: Mapping[str, GroupType], timestamp: str) -> str:
-    """Generate a detailed HTML report of duplicate groups"""
+    """Generate HTML report of duplicate groups"""
     report_dir = "Reports"
     os.makedirs(report_dir, exist_ok=True)
+    html_file = os.path.join(report_dir, f"duplicates_{timestamp}.html")
     
-    html_report = os.path.join(report_dir, f"duplicate_report_{timestamp}.html")
-    
-    css = """
-        <style>
-            body { font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }
-            .container { max-width: 1200px; margin: 0 auto; }
-            .header { background: #2c3e50; color: white; padding: 20px; border-radius: 5px; }
-            .group { background: white; margin: 20px 0; padding: 20px; border-radius: 5px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
-            .group-header { background: #34495e; color: white; padding: 10px; margin: -20px -20px 20px; border-radius: 5px 5px 0 0; }
-            .metadata { background: #ecf0f1; padding: 15px; margin: 10px 0; border-radius: 3px; }
-            .directory { margin: 15px 0; padding: 10px; background: #f9f9f9; border-left: 4px solid #2980b9; }
-            .file { margin: 5px 0 5px 20px; color: #444; }
-            .stats { font-weight: bold; color: #2c3e50; }
-            .total { background: #27ae60; color: white; padding: 15px; margin-top: 20px; border-radius: 5px; }
-        </style>
-    """
-    
-    with open(html_report, 'w', encoding='utf-8') as f:
+    with open(html_file, 'w', encoding='utf-8') as f:
         f.write(f"""
         <html>
         <head>
-            <title>Duplicate Files Report - {timestamp}</title>
-            {css}
+            <title>Duplicate Files Report</title>
+            <style>
+                body {{ font-family: Arial, sans-serif; margin: 20px; }}
+                .group {{ margin: 20px 0; padding: 10px; border: 1px solid #ccc; }}
+                .metadata {{ background: #f5f5f5; padding: 10px; margin: 10px 0; }}
+            </style>
         </head>
         <body>
-            <div class="container">
-                <div class="header">
-                    <h1>Duplicate Files Report</h1>
-                    <p>Scan Date: {timestamp}</p>
-                    <p>Total Groups: {len(groups)}</p>
-                </div>
+            <h1>Duplicate Files Report</h1>
+            <p>Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
         """)
         
-        total_savings = 0
-        for normalized, group_data in groups.items():
-            if isinstance(group_data, dict) and 'files' in group_data:
-                files = group_data['files']
-                metadata = group_data.get('metadata')
-                suggested_name = group_data.get('suggested_name')
-            else:
-                files = group_data
-                metadata = None
-                suggested_name = None
+        for name, group_data in groups.items():
+            f.write(f"""
+            <div class="group">
+                <h2>{name}</h2>
+            """)
             
-            if len(files) > 1:
-                total_size = sum(file['size'] for file in files)
-                potential_savings = total_size - min(file['size'] for file in files)
-                total_savings += potential_savings
-                
+            if isinstance(group_data, dict) and group_data.get('metadata'):
+                metadata = group_data['metadata']
                 f.write(f"""
-                    <div class="group">
-                        <div class="group-header">
-                            <h2>{normalized}</h2>
-                        </div>
-                """)
-                
-                if metadata:
-                    f.write(f"""
-                        <div class="metadata">
-                            <h3>Book Information:</h3>
-                            <p>Title: {metadata.title}</p>
-                            <p>Author: {', '.join(metadata.authors)}</p>
-                            <p>Published: {metadata.publish_year or 'Unknown'}</p>
-                            <p>ISBN: {metadata.isbn or 'Unknown'}</p>
-                            {'<p>Series: ' + metadata.series_name + ' #' + str(metadata.series_index) + '</p>' if metadata.series_name else ''}
-                            <p>Suggested Name: {suggested_name}</p>
-                        </div>
-                    """)
-                
-                # Group files by directory
-                dir_groups = defaultdict(list)
-                for file in files:
-                    dir_path = str(Path(file['path']).parent)
-                    dir_groups[dir_path].append(file)
-                
-                for dir_path, dir_files in dir_groups.items():
-                    dir_size = sum(f['size'] for f in dir_files)
-                    f.write(f"""
-                        <div class="directory">
-                            <h4>Directory: {dir_path}</h4>
-                            <p>Size: {format_size(dir_size)}</p>
-                    """)
-                    
-                    for file in dir_files:
-                        f.write(f"""
-                            <div class="file">
-                                {file['name']} ({format_size(file['size'])})
-                            </div>
-                        """)
-                    f.write("</div>")
-                f.write("</div>")
-        
-        f.write(f"""
-                <div class="total">
-                    <h2>Total Potential Space Savings: {format_size(total_savings)}</h2>
+                <div class="metadata">
+                    <p>Title: {getattr(metadata, 'title', 'Unknown')}</p>
+                    <p>Author: {getattr(metadata, 'author', 'Unknown')}</p>
+                    {f'<p>Series: {getattr(metadata, "series_name", "Unknown")} #{getattr(metadata, "series_index", "?")}' if getattr(metadata, "series_name", None) else ''}
+                    <p>OpenLibrary URL: <a href="{group_data.get('ol_url', '#')}">{group_data.get('ol_url', 'N/A')}</a></p>
+                    <p>Suggested Name: {group_data.get('suggested_name', 'N/A')}</p>
                 </div>
-            </div>
-        </body>
-        </html>
-        """)
+                """)
+            
+            files = group_data['files'] if isinstance(group_data, dict) else group_data
+            for file in files:
+                f.write(f"""
+                <p>{file['path']} ({file['size'] / 1024 / 1024:.2f} MB)</p>
+                """)
+            
+            f.write("</div>")
+        
+        f.write("</body></html>")
     
-    return html_report
+    return html_file
 
-def save_potential_duplicates(groups: Mapping[str, GroupType], timestamp: str) -> str:
-    """Save potential duplicate groups before OpenLibrary verification"""
-    report_dir = "Reports"
-    os.makedirs(report_dir, exist_ok=True)
-    
-    output_file = os.path.join(report_dir, f"potential_duplicates_{timestamp}.json")
-    
-    # Convert to serializable format
-    serializable_groups: Dict[str, List[Dict[str, Any]]] = {}
-    for name, group_data in groups.items():
-        files = group_data['files'] if isinstance(group_data, dict) else group_data
-        serializable_files = []
-        for file in files:
-            # Cast to ensure type safety
-            file_info = cast(FileInfo, {
-                'name': file['name'],
-                'path': str(file['path']),
-                'size': int(file['size']),
-                'original_name': file.get('original_name'),
-                'book_info': file.get('book_info')
-            })
-            serializable_files.append(dict(file_info))
-        serializable_groups[name] = serializable_files
-    
-    with open(output_file, 'w', encoding='utf-8') as f:
-        json.dump(serializable_groups, f, indent=2, ensure_ascii=False)
-    
-    return output_file
+def create_argument_parser():
+    """Create argument parser for command line interface"""
+    import argparse
+    parser = argparse.ArgumentParser(description='Find and process duplicate audiobooks')
+    parser.add_argument('directories', nargs='+', help='Directories to scan')
+    parser.add_argument('--extensions', nargs='+', default=SUPPORTED_EXTENSIONS,
+                      help='File extensions to scan (default: .mp3, .m4b, .aac)')
+    return parser
 
-@overload
-def convert_to_fileinfo(file_dict: Dict[str, Any]) -> FileInfo: ...
-
-@overload
-def convert_to_fileinfo(file_dict: FileInfo) -> FileInfo: ...
-
-def convert_to_fileinfo(file_dict: Union[Dict[str, Any], FileInfo]) -> FileInfo:
-    """Convert a dictionary to FileInfo TypedDict or return existing FileInfo"""
-    if isinstance(file_dict, dict):
+def convert_to_fileinfo(file_data: Union[Dict[str, Any], FileInfo]) -> FileInfo:
+    """Convert a dictionary or FileInfo to FileInfo type"""
+    if isinstance(file_data, dict):
         return FileInfo(
-            name=str(file_dict['name']),
-            path=str(file_dict['path']),
-            size=int(file_dict['size']),
-            original_name=file_dict.get('original_name'),
-            book_info=file_dict.get('book_info')
+            name=file_data.get('name', ''),
+            path=file_data.get('path', ''),
+            size=file_data.get('size', 0),
+            original_name=file_data.get('original_name'),
+            book_info=file_data.get('book_info')
         )
-    return file_dict
+    return file_data  # Already FileInfo type
 
-def convert_groups(groups: InitialGroupType) -> Dict[str, GroupType]:
-    """Convert initial groups to properly typed groups"""
-    return {
-        name: [convert_to_fileinfo(f) for f in files]
-        for name, files in groups.items()
-    }
-
-@overload
-def ensure_fileinfo(file: Dict[str, Any]) -> FileInfo: ...
-
-@overload
-def ensure_fileinfo(file: FileInfo) -> FileInfo: ...
-
-def ensure_fileinfo(file: Union[Dict[str, Any], FileInfo]) -> FileInfo:
-    """Ensure a file is in FileInfo format"""
-    if isinstance(file, dict):
-        return FileInfo(
-            name=str(file['name']),
-            path=str(file['path']),
-            size=int(file['size']),
-            original_name=file.get('original_name'),
-            book_info=file.get('book_info')
-        )
-    return file
+def main(directories: Optional[List[str]] = None) -> None:
+    """Main entry point for audiobook processing"""
+    if not directories:  # Handle both None and empty list cases
+        parser = create_argument_parser()
+        args = parser.parse_args()
+        directories = args.directories
+    
+    if not directories:  # If still no directories, exit
+        logger.error("No directories provided")
+        return
+        
+    finder = DuplicateFinder()
+    finder.process_directories(directories, SUPPORTED_EXTENSIONS)
 
 if __name__ == "__main__":
     main()
+    
+# Add these lines at the very end of the file
+__all__ = ['main', 'DuplicateFinder']
 
-class OpenLibraryRateLimiter:
-    def __init__(self, requests_per_second: float = 1.0):
-        self.rate_limit = requests_per_second
-        self.last_request = 0.0
-        self.lock = threading.Lock()
-
-    def wait(self):
-        with self.lock:
-            current_time = time.time()
-            time_since_last = current_time - self.last_request
-            if time_since_last < (1.0 / self.rate_limit):
-                sleep_time = (1.0 / self.rate_limit) - time_since_last
-                time.sleep(sleep_time)
-            self.last_request = time.time()
-
-class APIStats:
-    def __init__(self):
-        self.requests = 0
-        self.timeouts = 0
-        self.successes = 0
-        self.failures = 0
-        self.start_time = time.time()
-        
-    def log_timeout(self):
-        self.timeouts += 1
-        self.requests += 1
-        
-    def log_success(self):
-        self.successes += 1
-        self.requests += 1
-        
-    def log_failure(self):
-        self.failures += 1
-        self.requests += 1
-        
-    def get_stats(self) -> Dict[str, float]:
-        elapsed = time.time() - self.start_time
-        return {
-            'success_rate': (self.successes / self.requests * 100) if self.requests else 0,
-            'timeout_rate': (self.timeouts / self.requests * 100) if self.requests else 0,
-            'requests_per_second': self.requests / elapsed if elapsed > 0 else 0
-        }
-
-class RetryConfig:
-    def __init__(self, 
-                 max_retries: int = 3,
-                 initial_delay: float = 1.0,
-                 max_delay: float = 30.0,
-                 timeout: int = 10):
-        self.max_retries = max_retries
-        self.initial_delay = initial_delay
-        self.max_delay = max_delay
-        self.timeout = timeout
