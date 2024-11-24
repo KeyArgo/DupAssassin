@@ -1,23 +1,28 @@
 # DupAssassin
 
-A Python tool for finding and managing duplicate media files, with specialized handling for audiobooks.
+A Python tool for finding and managing duplicate media files, with specialized handling for audiobooks and OpenLibrary integration.
 
 ## Features
 
-- Detects duplicate files across multiple directories
-- Specialized audiobook handling with metadata support
-- Support for multiple media types:
-  - Movies
-  - TV Shows
-  - Audiobooks (with enhanced metadata)
-  - Ebooks
-- Interactive or report-only modes
-- Synology NAS compatibility (@eaDir handling)
-- Enhanced reporting capabilities:
-  - HTML reports with visual formatting
-  - JSON export of potential duplicates
+- Advanced duplicate detection with intelligent pattern matching
+- OpenLibrary API integration with rate limiting
+- Comprehensive reporting system:
+  - HTML reports with CSS styling
+  - JSON export for data persistence
   - Directory-based statistics
   - Space savings calculations
+  - Processing statistics and memory monitoring
+
+### Audiobook-Specific Features
+- Smart chapter and series pattern detection
+- OpenLibrary metadata enrichment
+- Rate-limited API integration (100 requests/5 minutes)
+- Multiple format support (.mp3, .m4b, .aac)
+- Advanced pattern matching for:
+  - Series detection (e.g., "Book #1", "Volume 2/3")
+  - Chapter identification
+  - Track numbering
+  - Multiple narrators/versions
 
 ## Installation
 
@@ -30,42 +35,44 @@ A Python tool for finding and managing duplicate media files, with specialized h
 
 ## Usage
 
-Run `python DupAssassin.py` and follow the interactive prompts.
+1. Run `python DupAssassin.py`
+2. Select media type (Audiobooks, Movies, TV Shows, Ebooks)
+3. Choose directories to scan
+4. Review potential duplicates with options:
+   - View duplicate groups
+   - View directory statistics
+   - View file patterns
+   - Process with OpenLibrary verification
 
-## Media Type Support
+## Technical Features
 
-### Audiobooks
-- Enhanced metadata support
-- OpenLibrary integration
-- Intelligent duplicate detection
-- Format: .mp3, .m4b, .aac
-- Advanced pattern matching for:
-  - Series detection
-  - Chapter identification
-  - Book numbering
-  - Multiple formats
+### Performance Optimization
+- Memory usage monitoring and garbage collection
+- Multi-threaded processing
+- Rate-limited API requests
+- Progress tracking with ETA
 
-### Other Media
-- Movies: .mp4, .mkv, .avi, .mov
-- TV Shows: .mp4, .mkv, .avi, .mov
-- Ebooks: .epub, .mobi, .pdf, .azw, .azw3, .djvu
+### Error Handling
+- Graceful API timeout handling
+- Interrupt signal management
+- Invalid file structure detection
+- Logging with configurable levels
 
-## Reports
-- HTML reports with CSS styling
-- JSON export for data persistence
-- Directory-based statistics
+### Reporting
+- Detailed HTML reports
+- JSON data export
+- Directory-based analysis
 - Space savings calculations
 - Processing statistics:
   - File processing rates
   - API success rates
-  - Error tracking
-  - Memory usage
-
-## License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details
+  - Memory usage tracking
+  - Error logging
 
 ## Requirements
 - Python 3.8+
 - OpenLibrary API access
-- Required Python packages in requirements.txt
+- Required packages in requirements.txt
+
+## License
+MIT License - See LICENSE file
